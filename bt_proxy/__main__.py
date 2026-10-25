@@ -81,7 +81,7 @@ async def wait_for_bt_mac(adapter: str | None = None) -> str:
 
 
 async def register_mdns(
-    name: str, port: int, mac: str
+    name: str, port: int, mac: str, api_encryption: str
 ) -> tuple[AsyncZeroconf, AsyncServiceInfo]:
     """Register the service via mDNS so Home Assistant can discover it."""
     local_ip = get_local_ip()
@@ -98,7 +98,7 @@ async def register_mdns(
             "mac": mac.replace(":", "").lower(),
             "platform": "linux",
             "network": "wifi",
-            "api_encryption": "",
+            "api_encryption": api_encryption,
         },
         server=f"{name}.local.",
     )
@@ -108,7 +108,7 @@ async def register_mdns(
     return zc, info
 
 
-async def async_main(args: argparse.Namespace) -> None:
+async def async_main(args: argparse.Namespace, psk: bytes | None) -> None:
     """Async main entry point."""
     bt_mac = await wait_for_bt_mac(args.adapter)
     logger.info("Bluetooth MAC: %s", bt_mac)
@@ -125,10 +125,18 @@ async def async_main(args: argparse.Namespace) -> None:
         mac_address=bt_mac,
         bt_mac_address=bt_mac,
         port=args.port,
+        psk=psk,
     )
 
     # Register mDNS
-    zc, service_info = await register_mdns(args.name, args.port, bt_mac)
+    api_encryption = ""
+    if psk is not None:
+        from .noise import PROTOCOL_NAME
+
+        api_encryption = PROTOCOL_NAME.decode()
+    zc, service_info = await register_mdns(
+        args.name, args.port, bt_mac, api_encryption
+    )
 
     # Start BLE scanning
     await ble_manager.start_scanning()
@@ -192,15 +200,37 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)",
     )
+    # A file rather than the key itself, which would show up in ps.
+    parser.add_argument(
+        "--encryption-key-file",
+        default=None,
+        help="File holding a base64 API encryption key, as in ESPHome's "
+        "api: encryption: key:. When set, only encrypted clients are accepted.",
+    )
 
     args = parser.parse_args()
+
+    psk = None
+    if args.encryption_key_file:
+        try:
+            from . import noise
+        except ImportError:
+            parser.error(
+                "--encryption-key-file needs the cryptography package "
+                "(pip install 'bt-proxy[encryption]')"
+            )
+        try:
+            with open(args.encryption_key_file) as f:
+                psk = noise.decode_psk(f.read())
+        except (OSError, ValueError) as e:
+            parser.error(f"--encryption-key-file: {e}")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    asyncio.run(async_main(args))
+    asyncio.run(async_main(args, psk))
 
 
 if __name__ == "__main__":

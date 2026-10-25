@@ -43,6 +43,7 @@ uv run python -m bt_proxy
 | `--max-connections` | `3` | Max concurrent BLE GATT connections |
 | `--adapter` | system default | Bluetooth adapter (e.g. `hci0`) |
 | `--log-level` | `INFO` | Logging verbosity |
+| `--encryption-key-file` | none | File holding a base64 API encryption key; when set, only encrypted clients are accepted |
 
 ### Example
 
@@ -57,7 +58,7 @@ uv run python -m bt_proxy --name living-room-proxy --friendly-name "Living Room 
 3. Listens on TCP port 6053 for ESPHome Native API connections
 4. When Home Assistant connects, it forwards BLE advertisements and handles GATT operations
 
-> **Note:** This uses the ESPHome Native API **plaintext** variant (no encryption). The Noise-encrypted protocol is currently not supported.
+> **Note:** Without `--encryption-key-file`, this uses the ESPHome Native API **plaintext** variant. With it, connections use ESPHome's Noise encryption, which needs the `cryptography` package (`uv sync --extra encryption`): generate a key with `openssl rand -base64 32` and enter the same key when Home Assistant asks for it.
 
 ## Running with Docker
 

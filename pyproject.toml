@@ -14,6 +14,10 @@ dependencies = [
     "zeroconf>=0.80.0",
 ]
 
+[project.optional-dependencies]
+# For --encryption-key-file.
+encryption = ["cryptography>=3.4"]
+
 [project.scripts]
 bt-proxy = "bt_proxy.__main__:main"
 

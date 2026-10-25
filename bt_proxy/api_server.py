@@ -5,15 +5,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import EMULATED_ESPHOME_VERSION, proto
 from .ble_manager import BLEManager
+
+if TYPE_CHECKING:
+    # Imported on first encrypted connection: it needs the optional
+    # cryptography package.
+    from . import noise
 
 logger = logging.getLogger(__name__)
 
 # How often to flush batched advertisements (seconds)
 ADV_BATCH_INTERVAL = 0.1
+# Advertisements per message, as ESPHome sends them. Keeps each message well
+# under a Noise frame's 64 KiB however many arrive in an interval.
+ADV_BATCH_SIZE = 16
 
 
 class APIConnection:
@@ -34,42 +42,49 @@ class APIConnection:
         self._adv_flush_task: asyncio.Task[None] | None = None
         self._closed = False
         self._peer = writer.get_extra_info("peername", ("unknown", 0))
+        # Set once a Noise handshake completes.
+        self._noise_send: noise.CipherState | None = None
+        self._noise_recv: noise.CipherState | None = None
 
     async def run(self) -> None:
         """Main loop: read and dispatch messages from the client."""
         logger.info("Client connected from %s", self._peer)
         try:
-            # Peek at first byte to detect Noise vs plaintext
-            first = await self.reader.readexactly(1)
-            if first[0] == 0x01:
-                # Noise protocol - client expects encryption
-                # Read the rest of the Noise hello to log it, then reject
-                logger.warning(
-                    "Client %s sent Noise protocol (0x01), not plaintext",
-                    self._peer,
-                )
-                return
-            elif first[0] != 0x00:
-                logger.warning(
-                    "Client %s sent unknown preamble 0x%02x",
-                    self._peer,
-                    first[0],
-                )
-                return
-            # Put the preamble byte back by handling the first message inline
-            data_length = await self._read_varint()
-            msg_type = await self._read_varint()
-            if data_length > 0:
-                data = await self.reader.readexactly(data_length)
+            if self.server.psk is not None:
+                if not await self._noise_handshake():
+                    return
             else:
-                data = b""
-            logger.debug(
-                "First message: type=%d len=%d data=%s",
-                msg_type,
-                data_length,
-                data.hex() if data else "(empty)",
-            )
-            await self._handle_message(msg_type, data)
+                # Peek at first byte to detect Noise vs plaintext
+                first = await self.reader.readexactly(1)
+                if first[0] == 0x01:
+                    logger.warning(
+                        "Client %s sent Noise protocol (0x01), but no "
+                        "encryption key is configured",
+                        self._peer,
+                    )
+                    return
+                elif first[0] != 0x00:
+                    logger.warning(
+                        "Client %s sent unknown preamble 0x%02x",
+                        self._peer,
+                        first[0],
+                    )
+                    return
+                # Put the preamble byte back by handling the first message
+                # inline
+                data_length = await self._read_varint()
+                msg_type = await self._read_varint()
+                if data_length > 0:
+                    data = await self.reader.readexactly(data_length)
+                else:
+                    data = b""
+                logger.debug(
+                    "First message: type=%d len=%d data=%s",
+                    msg_type,
+                    data_length,
+                    data.hex() if data else "(empty)",
+                )
+                await self._handle_message(msg_type, data)
 
             while not self._closed:
                 msg_type, data = await self._read_message()
@@ -81,7 +96,84 @@ class APIConnection:
         finally:
             await self._cleanup()
 
+    # ------------------------------------------------------------------
+    # Noise transport
+    #
+    # Every frame is 0x01 + uint16be(length) + payload. The client sends a
+    # hello frame and its handshake frame (0x00 + Noise message) back to back;
+    # we answer with a server hello (0x01 + name + NUL + mac + NUL), then the
+    # handshake reply (0x00 + Noise message) or a rejection (0x01 + reason).
+    # After that, each payload is encrypted uint16be(type) + uint16be(length)
+    # + protobuf.
+    # ------------------------------------------------------------------
+
+    async def _noise_handshake(self) -> bool:
+        """Run the server side of the handshake; False if it failed."""
+        from . import noise
+
+        hello = await self._read_noise_frame()
+        if hello is None:
+            # A plaintext client. Answering with a Noise frame makes it raise
+            # RequiresEncryptionAPIError, so HA asks for the key.
+            logger.warning(
+                "Client %s connected without encryption", self._peer
+            )
+            self._send_noise_reject(b"Bad indicator byte")
+            return False
+        # ESPHome binds the client's hello into the handshake.
+        prologue = b"NoiseAPIInit" + len(hello).to_bytes(2, "big") + hello
+
+        mac = self.server.mac_address.replace(":", "").lower()
+        self._write_noise_frame(
+            b"\x01" + self.server.name.encode() + b"\x00" + mac.encode() + b"\x00"
+        )
+
+        handshake = await self._read_noise_frame()
+        if not handshake or handshake[0] != 0x00:
+            logger.warning("Client %s sent a bad handshake frame", self._peer)
+            self._send_noise_reject(b"Bad handshake packet")
+            return False
+        try:
+            reply, self._noise_send, self._noise_recv = noise.NoiseResponder(
+                self.server.psk, prologue
+            ).respond(handshake[1:])
+        except ValueError:
+            logger.warning(
+                "Client %s failed the handshake; wrong encryption key?",
+                self._peer,
+            )
+            # aioesphomeapi matches this text to report an invalid key.
+            self._send_noise_reject(b"Handshake MAC failure")
+            return False
+        self._write_noise_frame(b"\x00" + reply)
+        logger.info("Client %s completed the Noise handshake", self._peer)
+        return True
+
+    async def _read_noise_frame(self) -> bytes | None:
+        """Read one frame, or return None if it isn't Noise-framed."""
+        header = await self.reader.readexactly(3)
+        if header[0] != 0x01:
+            return None
+        return await self.reader.readexactly(int.from_bytes(header[1:], "big"))
+
+    def _write_noise_frame(self, payload: bytes) -> None:
+        self.writer.write(b"\x01" + len(payload).to_bytes(2, "big") + payload)
+
+    def _send_noise_reject(self, reason: bytes) -> None:
+        self._write_noise_frame(b"\x01" + reason)
+
     async def _read_message(self) -> tuple[int, bytes]:
+        if self._noise_recv is not None:
+            frame = await self._read_noise_frame()
+            if frame is None:
+                raise ValueError("Invalid preamble in encrypted session")
+            msg = self._noise_recv.decrypt(frame)
+            if len(msg) < 4:
+                raise ValueError("Decrypted message too short")
+            return int.from_bytes(msg[:2], "big"), msg[4:]
+        return await self._read_plaintext_message()
+
+    async def _read_plaintext_message(self) -> tuple[int, bytes]:
         """Read one framed message from the wire.
 
         Wire format: 0x00 + varint(data_length) + varint(msg_type) + data
@@ -117,6 +209,15 @@ class APIConnection:
     def _send_message(self, msg_type: int, data: bytes) -> None:
         """Send a framed message to the client."""
         if self._closed:
+            return
+        if self._noise_send is not None:
+            msg = (
+                msg_type.to_bytes(2, "big") + len(data).to_bytes(2, "big") + data
+            )
+            try:
+                self._write_noise_frame(self._noise_send.encrypt(msg))
+            except ValueError as e:
+                logger.error("Dropping message type %d: %s", msg_type, e)
             return
         frame = proto.frame_message(msg_type, data)
         self.writer.write(frame)
@@ -506,10 +607,13 @@ class APIConnection:
                 if self._adv_batch:
                     batch = self._adv_batch
                     self._adv_batch = []
-                    resp = proto.encode_ble_raw_advertisements_response(batch)
-                    self._send_message(
-                        proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp
-                    )
+                    for i in range(0, len(batch), ADV_BATCH_SIZE):
+                        resp = proto.encode_ble_raw_advertisements_response(
+                            batch[i : i + ADV_BATCH_SIZE]
+                        )
+                        self._send_message(
+                            proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp
+                        )
                     try:
                         await self.writer.drain()
                     except (ConnectionResetError, OSError):
@@ -569,6 +673,7 @@ class APIServer:
         mac_address: str = "",
         bt_mac_address: str = "",
         port: int = 6053,
+        psk: bytes | None = None,
     ):
         self.ble_manager = ble_manager
         self.name = name
@@ -576,6 +681,8 @@ class APIServer:
         self.mac_address = mac_address
         self.bt_mac_address = bt_mac_address
         self.port = port
+        # With a key, only Noise-encrypted clients are accepted.
+        self.psk = psk
         self._connections: list[APIConnection] = []
         self._server: asyncio.Server | None = None
 
